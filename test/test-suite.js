@@ -4524,6 +4524,171 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
     }
   );
 
+  /* GHSA-c6gr-qvv4-5v3f: an SVG animation element (<animate>, <set>, ...)
+     targeting href lets an allowed <a> get a javascript: link after
+     sanitization (attributeName="href" values="x;javascript:..." passes the
+     URI check on values). An attributeName attribute whose value names href
+     is now always removed, even when animations are allowed and even when a
+     hook asks to keep it.
+     The serialized output is compared lowercased, as browsers and jsdom do
+     not agree on the case of the SVG attribute name. */
+  var hasAnimatedHref = function (clean) {
+    return /attributename/.test(clean.toLowerCase());
+  };
+  QUnit.test(
+    'GHSA-c6gr-qvv4-5v3f: attributeName="href" is removed from allowed animations',
+    function (assert) {
+      var payloads = [
+        {
+          dirty:
+            '<svg><a><animate attributeName="href" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'] },
+          tag: '<animate',
+        },
+        {
+          dirty:
+            '<svg><a><animate attributeName="href" dur="1s" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'], ADD_ATTR: ['attributeName'] },
+          tag: '<animate',
+        },
+        {
+          dirty:
+            '<svg><a><set attributeName="href" to="javascript:alert(1)">' +
+            '</set><text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['set'], ADD_ATTR: ['to'] },
+          tag: '<set',
+        },
+        {
+          dirty:
+            '<svg><a><animate attributeName="xlink:href" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'] },
+          tag: '<animate',
+        },
+        {
+          dirty:
+            '<svg><a><animate ATTRIBUTENAME="href" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'] },
+          tag: '<animate',
+        },
+        {
+          dirty:
+            '<svg><a><animate attributeName="  href  " ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: { ADD_TAGS: ['animate'] },
+          tag: '<animate',
+        },
+        {
+          // animateTransform is allowed by the default configuration
+          dirty:
+            '<svg><a><animateTransform attributeName="href" ' +
+            'values="x;javascript:alert(1)"></animateTransform>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          config: {},
+          tag: '<animatetransform',
+        },
+      ];
+
+      payloads.forEach(function (payload) {
+        withFreshPurify(function (purify) {
+          var clean = purify.sanitize(payload.dirty, payload.config);
+          assert.ok(
+            clean.toLowerCase().indexOf(payload.tag) !== -1,
+            payload.dirty + ': animation element kept (' + clean + ')'
+          );
+          assert.notOk(
+            hasAnimatedHref(clean),
+            payload.dirty + ': attributeName removed (' + clean + ')'
+          );
+        });
+      });
+    }
+  );
+
+  QUnit.test(
+    'GHSA-c6gr-qvv4-5v3f: attributeName="href" is removed even when a hook forces it to be kept',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        purify.addHook('uponSanitizeAttribute', function (node, data) {
+          if (data.attrName === 'attributename') {
+            data.forceKeepAttr = true;
+          }
+        });
+
+        var clean = purify.sanitize(
+          '<svg><a><animate attributeName="href" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          { ADD_TAGS: ['animate'] }
+        );
+        assert.notOk(
+          hasAnimatedHref(clean),
+          'attributeName removed despite forceKeepAttr (' + clean + ')'
+        );
+      });
+    }
+  );
+
+  QUnit.test(
+    'GHSA-c6gr-qvv4-5v3f: a hook rewriting attributeName to href does not keep it',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        purify.addHook('uponSanitizeAttribute', function (node, data) {
+          if (data.attrName === 'attributename') {
+            data.attrValue = 'href';
+          }
+        });
+
+        var clean = purify.sanitize(
+          '<svg><a><animate attributeName="fill" ' +
+            'values="x;javascript:alert(1)"></animate>' +
+            '<text x="20" y="20">click</text></a></svg>',
+          { ADD_TAGS: ['animate'] }
+        );
+        assert.notOk(
+          hasAnimatedHref(clean),
+          'rewritten attributeName removed (' + clean + ')'
+        );
+      });
+    }
+  );
+
+  QUnit.test(
+    'GHSA-c6gr-qvv4-5v3f: attributeName targeting other attributes is kept',
+    function (assert) {
+      withFreshPurify(function (purify) {
+        var clean = purify.sanitize(
+          '<svg><rect width="10" height="10">' +
+            '<animate attributeName="fill" values="red;blue" dur="1s">' +
+            '</animate></rect></svg>',
+          { ADD_TAGS: ['animate'] }
+        );
+        assert.ok(
+          clean.toLowerCase().indexOf('attributename="fill"') !== -1,
+          'attributeName="fill" kept (' + clean + ')'
+        );
+
+        clean = purify.sanitize(
+          '<svg><rect width="10" height="10">' +
+            '<animateTransform attributeName="transform" type="rotate" ' +
+            'from="0" to="90" dur="1s"></animateTransform></rect></svg>'
+        );
+        assert.ok(
+          clean.toLowerCase().indexOf('attributename="transform"') !== -1,
+          'attributeName="transform" kept (' + clean + ')'
+        );
+      });
+    }
+  );
+
   QUnit.test(
     'Test protection from prototype pollution of documentMode',
     function (assert) {
