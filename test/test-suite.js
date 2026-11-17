@@ -676,6 +676,101 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
     assert.equal(dirty, clean); // should return the input node
     assert.equal(dirty.href, ''); // should still sanitize
   });
+  QUnit.test(
+    'setConfig({IN_PLACE}) is not disabled by an intervening string call (REPORT-2)',
+    function (assert) {
+      DOMPurify.setConfig({ IN_PLACE: true });
+      try {
+        var div1 = document.createElement('div');
+        div1.innerHTML = '<img onerror="alert(1)">'; // no src: avoid a load
+        var ret1 = DOMPurify.sanitize(div1);
+        assert.equal(ret1, div1, 'baseline: returns the same node');
+        assert.notOk(
+          /onerror/i.test(div1.innerHTML),
+          'baseline: node sanitized in place'
+        );
+
+        // An innocuous string call must not flip the persistent IN_PLACE
+        // flag (under setConfig, _parseConfig is skipped on later calls).
+        var str = DOMPurify.sanitize('<b>hello</b><i onclick="alert(1)">x</i>');
+        assert.equal(
+          str,
+          '<b>hello</b><i>x</i>',
+          'string call under a persistent IN_PLACE config returns a string'
+        );
+
+        var div2 = document.createElement('div');
+        div2.innerHTML = '<img onerror="alert(1)">';
+        var ret2 = DOMPurify.sanitize(div2);
+        assert.equal(
+          ret2,
+          div2,
+          'after string call: still returns the same node'
+        );
+        assert.notOk(
+          /onerror/i.test(div2.innerHTML),
+          'after string call: node still sanitized in place'
+        );
+
+        // A stringified object takes the string path as well.
+        DOMPurify.sanitize({
+          toString: function () {
+            return '<b>hello</b>';
+          },
+        });
+
+        var div3 = document.createElement('div');
+        div3.innerHTML = '<img onerror="alert(1)">';
+        var ret3 = DOMPurify.sanitize(div3);
+        assert.equal(
+          ret3,
+          div3,
+          'after stringified-object call: still returns the same node'
+        );
+        assert.notOk(
+          /onerror/i.test(div3.innerHTML),
+          'after stringified-object call: node still sanitized in place'
+        );
+      } finally {
+        DOMPurify.clearConfig();
+      }
+    }
+  );
+  QUnit.test(
+    'a kill-decision on a detached IN_PLACE root is not a silent no-op (REPORT-3)',
+    function (assert) {
+      // A detached <style> whose text breaks out of the element trips the
+      // mXSS canary. _forceRemove cannot detach a parentless root, so the
+      // node must be neutralized (or the call must throw) rather than be
+      // handed back intact while DOMPurify.removed claims a removal.
+      var style = document.createElement('style');
+      style.textContent = '</style><img onerror=alert(1)>'; // no src
+      var ret = null;
+      try {
+        ret = DOMPurify.sanitize(style, { IN_PLACE: true });
+      } catch (_) {
+        assert.ok(true, 'fail-closed by throwing is acceptable');
+        return;
+      }
+
+      // Emulate the app-side store-and-rerender (serialize -> reparse).
+      var probe = document.createElement('div');
+      probe.innerHTML = (ret || style).outerHTML;
+      assert.notOk(
+        probe.querySelector('[onerror],[onload],script'),
+        'no executable sink survives serialize/reparse: ' + probe.innerHTML
+      );
+
+      var claimedRemoval = DOMPurify.removed.some(function (entry) {
+        return entry.element === style;
+      });
+      var stillDangerous = /<\/style|onerror/i.test(style.textContent || '');
+      assert.notOk(
+        claimedRemoval && stillDangerous,
+        'DOMPurify.removed bookkeeping matches reality'
+      );
+    }
+  );
   QUnit.test('Config-Flag tests: FORBID_TAGS', function (assert) {
     //FORBID_TAGS
     assert.equal(
@@ -4733,6 +4828,230 @@ module.exports = function (DOMPurify, window, tests, xssTests) {
       obj.constructor.prototype.ALLOWED_ATTR = ["src", "onerror"];
       var clean = DOMPurify.sanitize('<img src=x onerror=alert(1)>');
       assert.equal(clean, '<img src="x">');
+    }
+  );
+
+  // =======================================================================
+  // DOM clobbering - comprehensive matrix ("roundhouse")
+  //
+  // A tripwire over the full cross-product of clobber-carrier markup and the
+  // property/method names DOMPurify relies on when reading DOM nodes. The
+  // carrier is <form>: its named/id children shadow built-ins via
+  // LegacyOverrideBuiltIns, which is the element-level clobbering vector the
+  // sanitizer must survive.
+  //
+  // IMPORTANT: this override is a *real-browser* behavior. jsdom does NOT
+  // implement it, so under jsdom these tests pass trivially (no clobber ever
+  // happens) - they only grow teeth in the browser (karma) run. The first
+  // assertion reports whether the override is live in the current engine so
+  // a green jsdom run is not mistaken for real coverage.
+  // =======================================================================
+
+  // Names DOMPurify (or a downstream consumer) reads off a node. Shadowing
+  // any of these is the lever an attacker would pull.
+  var CLOBBER_NAMES = [
+    // identity / type
+    'nodeName',
+    'nodeType',
+    'nodeValue',
+    'tagName',
+    'localName',
+    'namespaceURI',
+    'prefix',
+    // content
+    'textContent',
+    'innerHTML',
+    'outerHTML',
+    'innerText',
+    'data',
+    // tree navigation
+    'parentNode',
+    'parentElement',
+    'childNodes',
+    'children',
+    'firstChild',
+    'lastChild',
+    'firstElementChild',
+    'lastElementChild',
+    'nextSibling',
+    'previousSibling',
+    'nextElementSibling',
+    'previousElementSibling',
+    'ownerDocument',
+    'getRootNode',
+    'content',
+    // attributes
+    'attributes',
+    'getAttribute',
+    'getAttributeNode',
+    'getAttributeNames',
+    'hasAttribute',
+    'hasAttributes',
+    'setAttribute',
+    'setAttributeNS',
+    'removeAttribute',
+    'removeAttributeNS',
+    // mutation
+    'removeChild',
+    'appendChild',
+    'insertBefore',
+    'replaceChild',
+    'cloneNode',
+    'remove',
+    'replaceWith',
+    'before',
+    'after',
+    // shadow / query
+    'shadowRoot',
+    'host',
+    'attachShadow',
+    'querySelector',
+    'querySelectorAll',
+    'getElementsByTagName',
+    'matches',
+    'closest',
+    // misc props read during sanitization or by consumers
+    'classList',
+    'className',
+    'id',
+    'name',
+    'is',
+    'value',
+    'type',
+    'style',
+  ];
+
+  // Inert sinks: none auto-loads (no <img src>), none executes in a parsed
+  // or disconnected document, so the harness can never fire them itself -
+  // yet each leaves a syntactic trace if sanitization is defeated.
+  var CLOBBER_SINKS =
+    '<img onerror="window.__clob=(window.__clob||0)+1">' +
+    '<a href="javascript:window.__clob=1">x</a>' +
+    '<script>window.__clob=1</script>' +
+    '<div onclick="window.__clob=1">z</div>';
+
+  var clobberHasSink = function (s) {
+    return /\son\w+\s*=|<script|javascript:/i.test(s);
+  };
+  // Re-parse in an inert document (no browsing context: nothing loads/runs)
+  var clobberReparseSink = function (s) {
+    var doc = document.implementation.createHTMLDocument('');
+    doc.body.innerHTML = s;
+    return doc.querySelector('[onerror],[onload],[onclick],script');
+  };
+
+  var clobberPayloads = function (name) {
+    return [
+      '<form><input name="' + name + '">' + CLOBBER_SINKS + '</form>',
+      '<form><input id="' + name + '">' + CLOBBER_SINKS + '</form>',
+      // two same-named controls -> a RadioNodeList/HTMLCollection clobber
+      '<form><input name="' +
+        name +
+        '"><input name="' +
+        name +
+        '">' +
+        CLOBBER_SINKS +
+        '</form>',
+      '<form name="' + name + '">' + CLOBBER_SINKS + '</form>',
+    ];
+  };
+
+  QUnit.test(
+    'DOM clobbering matrix: no clobbering combination defeats sanitization (string path)',
+    function (assert) {
+      window.__clob = 0;
+
+      // Report whether this engine overrides built-ins at all.
+      var overrideLive = false;
+      try {
+        var probe = document.createElement('form');
+        probe.innerHTML =
+          '<input name="attributes"><input name="getAttributeNames">';
+        var realAttributes = Object.getOwnPropertyDescriptor(
+          window.Element.prototype,
+          'attributes'
+        ).get.call(probe);
+        overrideLive =
+          typeof probe.nodeName !== 'string' ||
+          typeof probe.getAttributeNames !== 'function' ||
+          probe.attributes !== realAttributes;
+      } catch (_) {}
+
+      assert.ok(
+        true,
+        'form LegacyOverrideBuiltIns active in this engine: ' + overrideLive
+      );
+
+      var failures = [];
+      var allBlocks = [];
+      CLOBBER_NAMES.forEach(function (name) {
+        clobberPayloads(name).forEach(function (payload) {
+          allBlocks.push(payload);
+          var out = DOMPurify.sanitize(payload);
+          if (clobberHasSink(out) || clobberReparseSink(out)) {
+            failures.push(name + ' :: ' + out.slice(0, 160));
+          }
+        });
+      });
+      assert.deepEqual(
+        failures,
+        [],
+        'every individual clobber payload sanitized to a sink-free result'
+      );
+
+      // The roundhouse: the entire matrix in a single block.
+      var big = DOMPurify.sanitize(allBlocks.join(''));
+      assert.notOk(
+        clobberHasSink(big) || clobberReparseSink(big),
+        'combined clobbering block leaves no executable sink'
+      );
+
+      assert.equal(
+        window.__clob,
+        0,
+        'no clobbering payload executed during the test'
+      );
+    }
+  );
+
+  QUnit.test(
+    'DOM clobbering matrix: clobbered IN_PLACE roots throw or sanitize safely',
+    function (assert) {
+      window.__clob = 0;
+      // Disconnected roots, inert sinks: nothing loads or fires here.
+      var inPlaceSinks =
+        '<img onerror="window.__clob=1">' +
+        '<a href="javascript:window.__clob=1">x</a>' +
+        '<div onclick="window.__clob=1">z</div>';
+
+      var failures = [];
+      CLOBBER_NAMES.forEach(function (name) {
+        var root = document.createElement('form');
+        root.innerHTML = '<input name="' + name + '">' + inPlaceSinks;
+
+        var threw = false;
+        var out = null;
+        try {
+          out = DOMPurify.sanitize(root, { IN_PLACE: true });
+        } catch (_) {
+          threw = true; // fail-closed is acceptable (clobbered/forbidden root)
+        }
+
+        // Either it threw, or the returned node carries no sink.
+        if (!threw && clobberHasSink(out.outerHTML)) {
+          failures.push(name + ' :: ' + String(out.outerHTML).slice(0, 160));
+        }
+      });
+      assert.deepEqual(
+        failures,
+        [],
+        'every clobbered IN_PLACE root threw or returned a sink-free node'
+      );
+      assert.equal(
+        window.__clob,
+        0,
+        'no payload executed during IN_PLACE matrix'
+      );
     }
   );
 };

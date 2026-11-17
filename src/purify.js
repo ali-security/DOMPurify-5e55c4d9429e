@@ -1047,10 +1047,11 @@ function createDOMPurify(window = getGlobal()) {
    *
    * @param   {Node} currentNode to check for permission to exist
    * @param   {Node} root the root node of the current walk
+   * @param   {Boolean} inPlace whether the current call sanitizes in place
    * @return  {Boolean} true if node was killed, false if left alive
    */
   // eslint-disable-next-line complexity
-  const _sanitizeElements = function (currentNode, root) {
+  const _sanitizeElements = function (currentNode, root, inPlace) {
     let content;
 
     /* Execute a hook if present */
@@ -1061,7 +1062,7 @@ function createDOMPurify(window = getGlobal()) {
        hook below), neutralizing the detached subtree first so a queued
        resource handler on it cannot fire in page scope after we return. */
     if (
-      IN_PLACE &&
+      inPlace &&
       currentNode !== root &&
       getParentNode(currentNode) === null
     ) {
@@ -1102,7 +1103,7 @@ function createDOMPurify(window = getGlobal()) {
        ancestor, a later sibling) is caught by _neutralizeEscapedElements at
        the end of the call. */
     if (
-      IN_PLACE &&
+      inPlace &&
       currentNode !== root &&
       getParentNode(currentNode) === null
     ) {
@@ -1487,8 +1488,9 @@ function createDOMPurify(window = getGlobal()) {
    * _sanitizeShadowDOM
    *
    * @param  {DocumentFragment} fragment to iterate over recursively
+   * @param  {Boolean} inPlace whether the current call sanitizes in place
    */
-  const _sanitizeShadowDOM = function (fragment) {
+  const _sanitizeShadowDOM = function (fragment, inPlace) {
     let shadowNode;
     const shadowIterator = _createIterator(fragment);
 
@@ -1500,7 +1502,7 @@ function createDOMPurify(window = getGlobal()) {
       _executeHook('uponSanitizeShadowNode', shadowNode, null);
 
       /* Sanitize tags and elements */
-      if (_sanitizeElements(shadowNode, fragment)) {
+      if (_sanitizeElements(shadowNode, fragment, inPlace)) {
         continue;
       }
 
@@ -1537,7 +1539,7 @@ function createDOMPurify(window = getGlobal()) {
          of a foreign realm is walked too. */
       if (_isDocumentFragment(shadowNode.content)) {
         shadowNode.content.__depth = shadowNode.__depth;
-        _sanitizeShadowDOM(shadowNode.content);
+        _sanitizeShadowDOM(shadowNode.content, inPlace);
       }
 
       /* An element iterated here may itself host an attached shadow root.
@@ -1552,7 +1554,7 @@ function createDOMPurify(window = getGlobal()) {
         const innerShadowRoot = getShadowRoot(shadowNode);
         if (_isDocumentFragment(innerShadowRoot)) {
           innerShadowRoot.__depth = shadowNode.__depth;
-          _sanitizeShadowDOM(innerShadowRoot);
+          _sanitizeShadowDOM(innerShadowRoot, inPlace);
         }
       }
 
@@ -1654,12 +1656,15 @@ function createDOMPurify(window = getGlobal()) {
     /* Clean up removed elements */
     DOMPurify.removed = [];
 
-    /* Check if dirty is correctly typed for IN_PLACE */
-    if (typeof dirty === 'string') {
-      IN_PLACE = false;
-    }
+    /* Resolve IN_PLACE for this call without mutating persistent config.
+       Writing the IN_PLACE closure variable here leaks under setConfig(),
+       where _parseConfig is skipped on later calls: a single string call would
+       disable in-place mode for every subsequent node call, returning a
+       sanitized copy while leaving the caller's node - which in-place callers
+       keep using and whose return value they ignore - unsanitized. REPORT-2. */
+    const inPlace = IN_PLACE && typeof dirty !== 'string' && _isNode(dirty);
 
-    if (IN_PLACE) {
+    if (inPlace) {
       /* Pre-flight the root through _isClobbered. The iterator-driven
          removal path can not detach a parent-less root: _forceRemove
          falls back to setting outerHTML, which is a no-op on a node with
@@ -1726,7 +1731,7 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     /* Get node iterator */
-    const walkRoot = IN_PLACE ? dirty : body;
+    const walkRoot = inPlace ? dirty : body;
     const nodeIterator = _createIterator(walkRoot);
 
     /* Now start iterating over the created document */
@@ -1738,7 +1743,7 @@ function createDOMPurify(window = getGlobal()) {
         }
 
         /* Sanitize tags and elements */
-        if (_sanitizeElements(currentNode, walkRoot)) {
+        if (_sanitizeElements(currentNode, walkRoot, inPlace)) {
           continue;
         }
 
@@ -1775,7 +1780,7 @@ function createDOMPurify(window = getGlobal()) {
            instanceof, so <template>.content of a foreign realm is walked. */
         if (_isDocumentFragment(currentNode.content)) {
           currentNode.content.__depth = currentNode.__depth;
-          _sanitizeShadowDOM(currentNode.content);
+          _sanitizeShadowDOM(currentNode.content, inPlace);
         }
 
         /* Check attributes, sanitize if necessary */
@@ -1790,7 +1795,7 @@ function createDOMPurify(window = getGlobal()) {
          is never handed back but may still carry a queued resource
          handler: defuse it before the error propagates.
          GHSA-mrv2-3pqr-j5jr */
-      if (IN_PLACE) {
+      if (inPlace) {
         _neutralizeEscapedElements(dirty, inPlaceNodes);
       }
 
@@ -1800,7 +1805,7 @@ function createDOMPurify(window = getGlobal()) {
     oldNode = null;
 
     /* If we sanitized `dirty` in-place, return it. */
-    if (IN_PLACE) {
+    if (inPlace) {
       /* The in-place ROOT may itself have been force-removed during the walk
          (a rawtext root killed by the SAFE_FOR_XML raw text probe, a
          noscript/noembed root, a disallowed root, an mXSS-canary root, ...).
